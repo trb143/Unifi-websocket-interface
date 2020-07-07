@@ -2,7 +2,7 @@
 #
 # unifi_client.py
 #
-# Copyright (c) 2019 Nick Waterton <nick.waterton@med.ge.com>
+# Copyright (c) 2019,2020 Nick Waterton <nick.waterton@med.ge.com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -20,12 +20,44 @@
 #need to install websockets-client (pip install websocket-client)
 #or aiohttp (pip install aiohttp) - python 3 only!
 
+# N Waterton 10th September 2019 V1.1.2: added "sta:sync" message type found in controller 5.11.39
+# N Waterton 13th February  2020 V 1.1.3: added basic support for UDM Pro
+# N Waterton 15th February  2020 V 1.1.4: added enhanced support for UDM Pro
+# N Waterton 21st February  2020 V 1.1.5: added api call feature
+# N Waterton 4th  June      2020 V 1.1.6: reduced logging from device:update and sta:sync messages (now debug only)     
+
+'''
+Not all of these work, but good starting point...
+apps: "/api/apps",
+system: "/api/system",
+firmwareUpdate: "/api/firmware/update",
+firmwareSchedule: "/api/firmware/schedule",
+device: {
+    general: "/api/device/general"
+},
+controller: "/api/controllers",
+status: "/status",
+login: "/auth/login",
+logout: "/auth/logout",
+rebootDevice: "/api/system/reboot",
+powerOff: "/api/system/poweroff",
+factoryReset: "/api/system/reset",
+eraseAndFormat: "/api/storage/eraseAndFormat",
+sshEnable: "/api/system/ssh/enable",
+sshPassword: "/api/system/ssh/setpassword",
+location: "/api/system/location",
+timezone: "/api/system/timezone",
+systemWS: "/api/ws/system",
+downloadSupportFile: "/api/support/generate"
+'''
+
 from __future__ import print_function
 
 import json
 import sys
 import time
 import threading
+import requests
 try:
     from queue import Queue
 except ImportError:
@@ -35,29 +67,46 @@ from collections import OrderedDict
 import logging
 from logging.handlers import RotatingFileHandler
 
-__VERSION__ = '1.1.0'
+__VERSION__ = '1.1.6'
 
 log = logging.getLogger('Main')
 
 class UnifiClient(object):
 
-    def __init__(self, username, password, host='localhost', port=8443, ssl_verify=False, q=None):
+    def __init__(self, username, password, host='localhost', port=8443, ssl_verify=False, q=None, timeout=10.0, unifi_os=None):
         self.username = username
         self.password = password
         self.host = host
         self.port = port
         self.ssl_verify = ssl_verify
+        self.timeout = timeout
+        self.unifi_os = unifi_os
+        self.client = None
+        self.session = None
         
-        self.url = 'https://' + self.host + ':' + str(port) + '/'
-        self.login_url = self.url + 'api/login'
+        if self.unifi_os is None:
+            self.unifi_os = self.is_unifi_os()
+        
+        if unifi_os:
+            # do not use port for unifi os based devices (UDM)
+            self.url = 'https://{}/proxy/network/'.format(self.host)
+            self.ws_url= 'wss://{}/proxy/network/wss/s/default/events'.format(self.host)
+            self.login_url = 'https://{}/api/auth/login'.format(self.host)
+        else:
+            self.url = 'https://{}:{}/'.format(self.host, self.port)
+            self.ws_url= 'wss://{}:{}/wss/s/default/events'.format(self.host, self.port)
+            self.login_url = self.url + 'api/login'
+        self.base_url = 'https://{}:{}/'.format(self.host, self.port)
         self.initial_info_url = self.url + 'api/s/default/stat/device'
         self.params = {'_depth': 4, 'test': 0}
-        self.ws_url= 'wss://{}:{}/wss/s/default/events'.format(self.host, self.port)
+        
         
         #dictionary for storing unifi data
         self.unifi_data = OrderedDict()
         #keep track of unknown message types
         self.message_types = {}
+        #keep track of mac to id's, if id missing
+        self.mac_id = {}
 
         #pass queues to child classes
         if q is None:
@@ -72,6 +121,38 @@ class UnifiClient(object):
         
         self.connect_websocket()
         
+    def is_unifi_os(self):
+        '''
+        check for Unifi OS controller eg UDM, UDM Pro.
+        HEAD request will return 200 id Unifi OS,
+        if this is a Standard controller, we will get 302 (redirect) to /manage
+        '''
+        if self.ssl_verify is False:
+            # Disable insecure warnings - our server doesn't have root certs
+            from requests.packages.urllib3.exceptions import InsecureRequestWarning
+            requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+    
+        r = requests.head('https://{}:{}'.format(self.host, self.port), verify=self.ssl_verify, timeout=self.timeout)
+        if r.status_code == 200:
+            log.info('Unifi OS controller detected')
+            return True
+        if r.status_code == 302:
+            log.info('Unifi Standard controller detected')
+            return False
+        log.warning('Unable to determine controller type - using Unifi Standard controller')
+        return False
+        
+    def api(self, command):
+        if self.client is None:
+            log.error('no client connected')
+        else:
+            try:
+                return self.client.api(command)
+            except Exception as e:
+                log.error('Error in API call: %s' % e)
+            
+        return None
+        
     def connect_websocket(self):
         '''
         connect python 2 or 3 websocket
@@ -79,9 +160,9 @@ class UnifiClient(object):
         '''
         if sys.version_info[0] == 3 and sys.version_info[1] > 3:
             from unifi_client_3 import UnifiClient3 #has to be in separate module to prevent python2 syntax errors
-            UnifiClient3(self.username,self.password,self.host,self.port,self.ssl_verify,self.queues)
+            self.client = UnifiClient3(self.username,self.password,self.host,self.port,self.ssl_verify,self.queues,self.timeout,self.unifi_os)
         else:
-            UnifiClient2(self.username,self.password,self.host,self.port,self.ssl_verify,self.queues)
+            self.client = UnifiClient2(self.username,self.password,self.host,self.port,self.ssl_verify,self.queues,self.timeout,self.unifi_os)
         
     def update_unifi_data(self, data):
         '''
@@ -92,7 +173,7 @@ class UnifiClient(object):
         unifi_data = OrderedDict()
         
         meta = data['meta']
-        update_type = meta.get("message", "device:sync")   #"events", "device:sync", "device:update", "speed-test:update", "user:sync", possibly others
+        update_type = meta.get("message", "device:sync")   #"events", "device:sync", "device:update", "speed-test:update", "user:sync", "sta:sync", possibly others
         data_list = data['data']
         
         if update_type == "device:sync":
@@ -100,6 +181,7 @@ class UnifiClient(object):
                 new_data={update["_id"]:update}
                 unifi_data.update(new_data)
                 log.info('Updating: %s (%s)' % (update["_id"], unifi_data[update["_id"]].get("name",'Unknown')))
+                #log.info('data: %s' % json.dumps(unifi_data, indent=2))
             self.sync_q.put(unifi_data)
             
         elif update_type == "events":
@@ -110,14 +192,21 @@ class UnifiClient(object):
             self.event_q.put(data['data'])
             
         elif update_type == "device:update":
-            log.info('received update: %s' % json.dumps(data, indent=2))
+            log.debug('received device:update: message')
+            log.debug('received update: %s' % json.dumps(data, indent=2))
             #do something with updates here
+            #note now receive temperature readings from udmp here (but also in device:sync, so ignore here).
         elif update_type == "user:sync":
-            log.info('received sync: %s' % json.dumps(data, indent=2))
+            log.info('received user:sync: message')
+            log.debug('received sync: %s' % json.dumps(data, indent=2))
             #do something with user syncs here
         elif update_type == "speed-test:update":
-            log.info('received speedtest: %s' % json.dumps(data, indent=2))
+            log.debug('received speedtest: %s' % json.dumps(data, indent=2))
             #do something with speed tests here
+        elif update_type == "sta:sync":
+            log.debug('received sta:sync: message')
+            log.debug('\n: %s' % json.dumps(data, indent=2))
+            #do something with station sync here
             
         else:
             log.warn('Unknown message type: %s, data: %s' % (update_type, json.dumps(data, indent=2)))
@@ -232,8 +321,8 @@ class UnifiClient2(UnifiClient):
     '''
     Python 2 websocket class
     '''
-    def __init__(self, username, password, host='localhost', port=8443, ssl_verify=False, q=None):
-        super(UnifiClient2, self).__init__(username, password, host, port, ssl_verify, q)
+    def __init__(self, username, password, host='localhost', port=8443, ssl_verify=False, q=None, timeout=10.0, unifi_os=None):
+        super(UnifiClient2, self).__init__(username, password, host, port, ssl_verify, q, timeout, unifi_os)
    
     def connect_websocket(self):
         t=threading.Thread(target=self.start_websocket)
@@ -246,6 +335,22 @@ class UnifiClient2(UnifiClient):
             self.simple_websocket()
             time.sleep(30)
             log.warn('Reconnecting websocket')
+            
+    def api(self, command):
+        if self.session is not None:
+            try:
+                r = self.session.get(self.base_url+command, verify=self.ssl_verify, timeout=self.timeout)
+                assert r.status_code == 200
+
+                data = r.json()
+                
+                log.debug('received API response: %s' % json.dumps(data, indent=2))
+                return data
+            except (AssertionError, requests.ConnectionError, requests.Timeout) as e:
+                log.error('API call %s failed: %s' % (command,e))
+            except Exception as e:
+                log.exception("API command exception: %s" % e)
+        return None      
 
     def simple_websocket(self):
         import requests
@@ -265,14 +370,15 @@ class UnifiClient2(UnifiClient):
         
         session = requests.Session()# This session is used to login and obtain a session ID
         session.verify = self.ssl_verify # not really needed as we disable checking in the post anyway
+        self.session = session
         
         try:
         
             # We Authenticate with one session to get a session ID and other validation cookies
-            r = session.post(self.login_url, json=json_request, verify=self.ssl_verify)
+            r = session.post(self.login_url, json=json_request, verify=self.ssl_verify, timeout=self.timeout)
             assert r.status_code == 200
 
-            r = session.get(self.initial_info_url, json=self.params, verify=self.ssl_verify)
+            r = session.get(self.initial_info_url, json=self.params, verify=self.ssl_verify, timeout=self.timeout)
             assert r.status_code == 200
 
             data = r.json()
@@ -284,10 +390,14 @@ class UnifiClient2(UnifiClient):
             cookies = requests.utils.dict_from_cookiejar(session.cookies)
             log.debug('cookies: %s' % cookies)
             #cookies example: {'csrf_token': 'icIkv3tcVjwlJ4TQbgyeCuEZiJGErAUy', 'unifises': 'nutupuMKrLC4eA6CRmS6yWcldWowJRT2'
-            csrf_token = cookies['csrf_token']
-            SESSIONID = cookies['unifises']
-            ws_cookies = "unifises=%s; csrf_token=%s" % (SESSIONID, csrf_token)
-            
+            if self.unifi_os:
+                SESSIONID = cookies.get('TOKEN')
+                ws_cookies = "TOKEN=%s" % (SESSIONID)
+            else:
+                csrf_token = cookies.get('csrf_token')
+                SESSIONID = cookies.get('unifises')
+                ws_cookies = "unifises=%s; csrf_token=%s" % (SESSIONID, csrf_token)
+  
             #optional debugging on
             if log.getEffectiveLevel() == logging.DEBUG:
                 websocket.enableTrace(True)
@@ -310,9 +420,12 @@ class UnifiClient2(UnifiClient):
                 self.update_unifi_data(json.loads(msg))
             log.info('WS disconnected')
 
-        except AssertionError as e:
+        except (AssertionError, requests.ConnectionError, requests.Timeout) as e:
             log.error("Connection failed error: %s" % e)
-               
+        except Exception as e:
+            log.exception("unknown exception: %s" % e)
+            
+        self.session = None       
         log.info('Exited')
         
 def setup_logger(logger_name, log_file, level=logging.DEBUG, console=False):
